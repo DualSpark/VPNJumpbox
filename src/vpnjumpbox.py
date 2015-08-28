@@ -12,14 +12,16 @@ FACTORY_DEFAULTS = {
     "instance_type": "t2.micro",
     "remote_access_cidr": "0.0.0.0/0",
     "ec2_key": "dualspark_rsa",
-    "subnet_cidrs": ['10.0.192.0/28','10.0.192.32/28', '10.0.192.64/28']
+    "subnet_cidrs": ['10.0.192.0/28', '10.0.192.32/28', '10.0.192.64/28'],
+    "admin_user": "openvpn"
 }
 
 CONFIG_SCHEMA = {
     "instance_type": "str",
     "remote_access_cidr": "str",
     "ec2_key": "str",
-    "subnet_cidrs": "list"
+    "subnet_cidrs": "list",
+    "admin_user": "str"
 }
 
 ASSOC_EIP_POLICY = Policy(
@@ -52,8 +54,9 @@ ASSOC_EIP_POLICY = Policy(
 
 JUMPBOX_USERDATA = resources.get_resource('jumpbox_userdata.sh', __name__)
 
-AMI_NAME = 'amazonLinuxAmiId'
+AMI_NAME = 'openVpn2020'
 SUBNET_LABEL = 'jumpbox'
+
 
 class VPNJumpbox(Template):
 
@@ -61,7 +64,8 @@ class VPNJumpbox(Template):
                  subnet_cidrs=FACTORY_DEFAULTS['subnet_cidrs'],
                  instance_type=FACTORY_DEFAULTS['instance_type'],
                  remote_access_cidr=FACTORY_DEFAULTS['remote_access_cidr'],
-                 ec2_key=FACTORY_DEFAULTS['ec2_key']):
+                 ec2_key=FACTORY_DEFAULTS['ec2_key'],
+                 admin_user=FACTORY_DEFAULTS['admin_user']):
 
         super(VPNJumpbox, self).__init__('VPNJumpbox')
 
@@ -69,6 +73,7 @@ class VPNJumpbox(Template):
         self.instance_type = instance_type
         self.remote_access_cidr = remote_access_cidr
         self.ec2_key = ec2_key
+        self.admin_user = admin_user
 
     @staticmethod
     def get_factory_defaults():
@@ -124,14 +129,6 @@ class VPNJumpbox(Template):
                     Timeout='PT10M'
                 )
             ),
-            # TerminationPolicies=['OldestLaunchConfiguration', 'ClosestToNextInstanceHour', 'Default'],
-            # UpdatePolicy=UpdatePolicy(
-            #     AutoScalingRollingUpdate=AutoScalingRollingUpdate(
-            #         PauseTime='PT15M',
-            #         MinInstancesInService="0",
-            #         MaxBatchSize='1',
-            #         WaitOnResourceSignals=True
-            #     )),
             DependsOn=[]))
 
         asg.Tags = [ASGTag('Name', self.name, True)]
@@ -142,8 +139,34 @@ class VPNJumpbox(Template):
         ))
 
     def _get_launch_config(self, asg_name, eip):
-        # TODO: Add sg ingress rules: TCP 443, TCP 943, UDP 1194
-        sg_ingress_rule = SecurityGroupRule(FromPort=22, ToPort=22, IpProtocol='tcp', CidrIp=self.remote_access_cidr)
+
+        # Stole comments on port binding from here:
+        # https://docs.openvpn.net/how-to-tutorialsguides/virtual-platforms/amazon-ec2-appliance-ami-quick-start-guide/
+
+        # 22 - SSH, used to remotely administrate your appliance. It is recommended that you restrict this port to
+        # trusted IP addresses. If you do not want to do this, leave the source as 0.0.0.0/0. To restrict ports to a
+        # specific subnet, enter the port number, then the subnet in CIDR notation (e.g. 12.34.56.0/24). For single IP
+        # addresses, /32 will need to be appended at the end (e.g. 22.33.44.55/32 for IP address 22.33.44.55). Click the
+        # Add Rule button when you are done with the rule, repeat the process as needed.
+        ssh_port = SecurityGroupRule(FromPort=22, ToPort=22, IpProtocol='tcp', CidrIp=self.remote_access_cidr)
+
+        # 443 - HTTPS, used by OpenVPN Access Server for the Client Web Server. This is the interface used by your
+        # users to log on to the VPN server and retrieve their keying and installation information. It is recommended
+        # that you leave this open to the world (i.e. leaving the source as 0.0.0.0/0). The OpenVPN Admin Web UI by
+        # default is also enabled on this port, although this can be turned off in the settings. In multi-daemon mode,
+        # the OpenVPN TCP daemon shares this port alongside with the Client Web Server, and your clients will initiate
+        # TCP based VPN sessions under this port number.
+        openvpn_auth_port = SecurityGroupRule(FromPort=443, ToPort=443, IpProtocol='tcp', CidrIp="0.0.0.0/0")
+
+        # 1194 - OpenVPN UDP port, used by your clients to initiate UDP based VPN sessions to the VPN server. This is
+        # the preferred way for your clients to communicate and this port should be open to all of your clients. You may
+        # change this port number in the settings to a non-standard port in the Admin Web UI if desired.
+        openvpn_vpn_port = SecurityGroupRule(FromPort=1194, ToPort=1194, IpProtocol='udp', CidrIp="0.0.0.0/0")
+
+        # 943 - The port number used by the Admin Web UI. By default, the Admin Web UI is also served on port 443. For
+        # security reasons, you can turn this setting off and restrict the Admin Web UI port to trusted IP addresses
+        # only.
+        openvpn_admin_port = SecurityGroupRule(FromPort=943, ToPort=943, IpProtocol='tcp', CidrIp=self.remote_access_cidr)
 
         # Create LaunchConfig, ASG
         sg = self.add_resource(
@@ -151,7 +174,12 @@ class VPNJumpbox(Template):
                 '%sSecurityGroup' % self.name,
                 GroupDescription='Security group for %s' % self.name,
                 VpcId=Ref(self.vpc_id),
-                SecurityGroupIngress=[sg_ingress_rule])
+                SecurityGroupIngress=[
+                    openvpn_auth_port,
+                    openvpn_admin_port,
+                    openvpn_vpn_port,
+                    ssh_port
+                ])
         )
 
         instance_profile = self.add_instance_profile(self.name, [ASSOC_EIP_POLICY], self.name)
@@ -161,7 +189,12 @@ class VPNJumpbox(Template):
         startup_vars.append(Join('=', ['REGION', Ref("AWS::Region")]))
         startup_vars.append(Join('=', ['STACKNAME', Ref("AWS::StackName")]))
         startup_vars.append(Join('=', ['ASG_NAME', asg_name]))
-        user_data = self.build_bootstrap([JUMPBOX_USERDATA], variable_declarations=startup_vars)
+        startup_vars.append(Join('=', ['public_hostname', Ref(eip)]))
+        startup_vars.append(Join('=', ['admin_user', self.admin_user]))
+        user_data = self.build_bootstrap(
+            [JUMPBOX_USERDATA],
+            prepend_line='#!/bin/bash -x',
+            variable_declarations=startup_vars)
 
         launch_config = self.add_resource(LaunchConfiguration(
             '%sLaunchConfiguration' % self.name,
