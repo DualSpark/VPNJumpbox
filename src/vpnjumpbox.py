@@ -173,7 +173,7 @@ class VPNJumpbox(Template):
             SecurityGroup(
                 '%sSecurityGroup' % self.name,
                 GroupDescription='Security group for %s' % self.name,
-                VpcId=Ref(self.vpc_id),
+                VpcId=self.vpc_id,
                 SecurityGroupIngress=[
                     openvpn_auth_port,
                     openvpn_admin_port,
@@ -201,7 +201,7 @@ class VPNJumpbox(Template):
             IamInstanceProfile=Ref(instance_profile),
             ImageId=FindInMap('RegionMap', Ref('AWS::Region'), AMI_NAME),
             InstanceType=self.instance_type,
-            SecurityGroups=[Ref(self.common_security_group), Ref(sg)],
+            SecurityGroups=[self.common_security_group, Ref(sg)],
             KeyName=self.ec2_key,
             AssociatePublicIpAddress=True,
             InstanceMonitoring=True,
@@ -212,7 +212,7 @@ class VPNJumpbox(Template):
     def _add_subnet_to_az(self, az, cidr, suffix):
         subnet = self.add_resource(Subnet(
             "%sSubnet%s" % (self.name, suffix),
-            VpcId=Ref(self.vpc_id),
+            VpcId=self.vpc_id,
             AvailabilityZone=az,
             CidrBlock=cidr,
             Tags=Tags(
@@ -222,13 +222,13 @@ class VPNJumpbox(Template):
 
         route_tbl = self.add_resource(RouteTable(
             "%sRouteTable%s" % (self.name, suffix),
-            VpcId=Ref(self.vpc_id),
+            VpcId=self.vpc_id,
             Tags=Tags(Name=Join("", [Ref("AWS::StackName"), "-public"]))
         ))
 
         route = self.add_resource(Route(
             "%sRoute%s" % (self.name, suffix),
-            GatewayId=Ref(self.igw),
+            GatewayId=self.igw,
             DestinationCidrBlock="0.0.0.0/0",
             RouteTableId=Ref(route_tbl),
         ))
